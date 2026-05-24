@@ -58,6 +58,10 @@ class TranslationRequest(BaseModel):
         default="general",
         description="Document type used for optional summary-length presets",
     )
+    auto_document_type: bool = Field(
+        default=False,
+        description="Automatically detect document_type from source text before applying presets",
+    )
     use_document_type_summary_preset: bool = Field(
         default=False,
         description="When true, override parallel_summary_max_chars with a document-type preset",

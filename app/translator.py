@@ -1,7 +1,9 @@
 import asyncio
+import json
 import os
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from statistics import mean
 from typing import Any, Callable, Dict, List, Tuple
 
@@ -54,7 +56,49 @@ DOCUMENT_TYPE_MODEL_PRESETS_ENV: Dict[str, str] = {
     "legal": "OPENAI_MODEL_LEGAL",
     "marketing": "OPENAI_MODEL_MARKETING",
 }
+DOCUMENT_TYPE_RULE_KEYWORDS_FILE = "document_type_rule_keywords.json"
+_DOCUMENT_TYPE_RULE_KEYWORDS_CACHE: Dict[str, Tuple[str, ...]] | None = None
 FIDELITY_FIRST_STYLE_GUIDE = "원문 구조, 숫자, 고유명사, 고정 용어를 우선 보존하고 의역을 최소화하는 직역 중심 문체"
+
+
+def _load_document_type_rule_keywords() -> Dict[str, Tuple[str, ...]]:
+    """문서 타입 자동 감지 키워드를 JSON 파일에서 읽는다."""
+
+    default: Dict[str, Tuple[str, ...]] = {
+        "technical": tuple(),
+        "legal": tuple(),
+        "marketing": tuple(),
+    }
+    keywords_path = Path(__file__).resolve().parent / DOCUMENT_TYPE_RULE_KEYWORDS_FILE
+
+    try:
+        with keywords_path.open("r", encoding="utf-8") as fp:
+            data = json.load(fp)
+    except (OSError, json.JSONDecodeError):
+        return default
+
+    if not isinstance(data, dict):
+        return default
+
+    parsed: Dict[str, Tuple[str, ...]] = {}
+    for doc_type in ["technical", "legal", "marketing"]:
+        raw_values = data.get(doc_type, [])
+        if isinstance(raw_values, list):
+            values = tuple(v.lower().strip() for v in raw_values if isinstance(v, str) and v.strip())
+            parsed[doc_type] = values
+        else:
+            parsed[doc_type] = tuple()
+
+    return parsed
+
+
+def _get_document_type_rule_keywords() -> Dict[str, Tuple[str, ...]]:
+    """문서 타입 감지 키워드를 캐시와 함께 반환한다."""
+
+    global _DOCUMENT_TYPE_RULE_KEYWORDS_CACHE
+    if _DOCUMENT_TYPE_RULE_KEYWORDS_CACHE is None:
+        _DOCUMENT_TYPE_RULE_KEYWORDS_CACHE = _load_document_type_rule_keywords()
+    return _DOCUMENT_TYPE_RULE_KEYWORDS_CACHE
 
 
 def _new_token(index: int) -> str:
@@ -459,6 +503,43 @@ def _resolve_parallel_summary_max_chars(request: TranslationRequest) -> int:
     if request.use_document_type_summary_preset:
         return DOCUMENT_TYPE_SUMMARY_PRESETS.get(request.document_type, PARALLEL_SUMMARY_MAX_CHARS)
     return request.parallel_summary_max_chars
+
+
+def _detect_document_type_from_text(text: str) -> str:
+    """원문 텍스트에서 문서 타입을 규칙 기반으로 추정한다.
+
+    - technical/legal/marketing 키워드 점수를 계산한다.
+    - 동점이거나 점수가 낮으면 general로 폴백한다.
+    """
+
+    normalized = text.lower()
+    scores: Dict[str, int] = {"technical": 0, "legal": 0, "marketing": 0}
+
+    for doc_type, keywords in _get_document_type_rule_keywords().items():
+        score = 0
+        for keyword in keywords:
+            if keyword in normalized:
+                score += 1
+        scores[doc_type] = score
+
+    best_type = max(scores, key=scores.get)
+    best_score = scores[best_type]
+    sorted_scores = sorted(scores.values(), reverse=True)
+    second_score = sorted_scores[1] if len(sorted_scores) > 1 else 0
+
+    # 신호가 약하거나(0), 동점 경쟁이 강하면 일반 문서로 처리한다.
+    if best_score == 0 or best_score == second_score:
+        return "general"
+
+    return best_type
+
+
+def _resolve_document_type(request: TranslationRequest) -> str:
+    """요청에서 최종 문서 타입을 결정한다."""
+
+    if not request.auto_document_type:
+        return request.document_type
+    return _detect_document_type_from_text(request.text)
 
 
 def _resolve_style_guide(request: TranslationRequest) -> str:
@@ -909,10 +990,13 @@ class TranslatorService:
         5) 결과 병합 및 평균 품질 점수 계산
         """
 
+        resolved_document_type = _resolve_document_type(request)
+        base_request = request.model_copy(update={"document_type": resolved_document_type})
+
         effective_request = (
-            request.model_copy(update={"max_retries_per_chunk": 0, "llm_reasoning": False})
-            if request.use_fidelity_first_preset
-            else request
+            base_request.model_copy(update={"max_retries_per_chunk": 0, "llm_reasoning": False})
+            if base_request.use_fidelity_first_preset
+            else base_request
         )
 
         source_text = effective_request.text

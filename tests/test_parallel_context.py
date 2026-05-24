@@ -6,7 +6,9 @@ from app.translator import (
     DOCUMENT_TYPE_STYLE_PRESETS,
     FIDELITY_FIRST_STYLE_GUIDE,
     TranslatorService,
+    _detect_document_type_from_text,
     _build_overlap_context,
+    _resolve_document_type,
     _resolve_effective_chunk_overlap,
     _resolve_model_name,
     _resolve_parallel_context_text,
@@ -222,3 +224,43 @@ def test_overlap_context_prefers_sentence_boundary() -> None:
     context = _build_overlap_context(previous_chunk, 80)
 
     assert context.startswith("두 번째")
+
+
+def test_detect_document_type_from_text_technical() -> None:
+    text = "Install SDK and configure API endpoint for database latency monitoring."
+    assert _detect_document_type_from_text(text) == "technical"
+
+
+def test_detect_document_type_from_text_legal() -> None:
+    text = "This agreement shall define liability and indemnify each party under Article 5."
+    assert _detect_document_type_from_text(text) == "legal"
+
+
+def test_detect_document_type_from_text_marketing() -> None:
+    text = "Our brand campaign boosts customer conversion and growth with promotion offers."
+    assert _detect_document_type_from_text(text) == "marketing"
+
+
+def test_detect_document_type_from_text_falls_back_to_general_on_tie() -> None:
+    text = "Install terms and conditions"
+    assert _detect_document_type_from_text(text) == "general"
+
+
+def test_resolve_document_type_uses_request_value_when_auto_off() -> None:
+    request = TranslationRequest(
+        text="Install SDK and configure API endpoint.",
+        target_language="ko",
+        document_type="legal",
+        auto_document_type=False,
+    )
+    assert _resolve_document_type(request) == "legal"
+
+
+def test_resolve_document_type_detects_when_auto_on() -> None:
+    request = TranslationRequest(
+        text="Install SDK and configure API endpoint.",
+        target_language="ko",
+        document_type="general",
+        auto_document_type=True,
+    )
+    assert _resolve_document_type(request) == "technical"
