@@ -28,9 +28,9 @@ class TranslationRequest(BaseModel):
         le=32,
         description="Maximum concurrent chunk translation tasks when parallel_chunk_translation=true",
     )
-    parallel_context_strategy: Literal["none", "source-summary"] = Field(
+    parallel_context_strategy: Literal["none", "glossary-only"] = Field(
         default="none",
-        description="Context strategy for parallel mode: none | source-summary",
+        description="Context strategy for parallel mode: none | glossary-only",
     )
     parallel_summary_max_chars: int = Field(
         default=120,
@@ -49,6 +49,10 @@ class TranslationRequest(BaseModel):
     use_document_type_style_preset: bool = Field(
         default=False,
         description="When true, inject document-type style guide preset into translation prompt",
+    )
+    use_fidelity_first_preset: bool = Field(
+        default=False,
+        description="When true, bias translation toward literal fidelity and prefer glossary-only context",
     )
     llm_model_override: Optional[str] = Field(
         default=None,

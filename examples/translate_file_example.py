@@ -48,10 +48,20 @@ class DemoTranslatorService(TranslatorService):
         return source_text[:120]
 
 
-async def run(use_real_llm: bool, provider: str, model_override: str | None) -> None:
-    input_path = Path("rotary_constitution_ko.txt")
+async def run(
+    use_real_llm: bool,
+    provider: str,
+    model_override: str | None,
+    fidelity_first: bool,
+    parallel: bool,
+    parallel_context_strategy: str,
+) -> None:
+    script_dir = Path(__file__).resolve().parent
+    input_path = script_dir / "rotary_constitution_ko.txt"
     mode_label = "real" if use_real_llm else "demo"
-    output_path = Path(f"rotary_constitution_en_output_{mode_label}_{provider}.txt")
+    fidelity_label = "fidelity" if fidelity_first else "standard"
+    parallel_label = "parallel" if parallel else "serial"
+    output_path = script_dir / f"rotary_constitution_en_output_{mode_label}_{fidelity_label}_{parallel_label}_{provider}.txt"
 
     source_text = input_path.read_text(encoding="utf-8")
 
@@ -71,7 +81,9 @@ async def run(use_real_llm: bool, provider: str, model_override: str | None) -> 
         chunk_size=2200,
         # 스키마 최소 제약(>=50) 범위에서 중복을 최소화한다.
         chunk_overlap=50,
-        parallel_chunk_translation=False,
+        parallel_chunk_translation=parallel,
+        parallel_context_strategy=parallel_context_strategy,
+        use_fidelity_first_preset=fidelity_first,
         llm_provider=provider,
         llm_model_override=resolved_model,
         llm_call_mode="ainvoke",
@@ -109,6 +121,22 @@ if __name__ == "__main__":
         default=None,
         help="Optional model override. If omitted, provider defaults are used.",
     )
+    parser.add_argument(
+        "--fidelity-first",
+        action="store_true",
+        help="Bias the translation toward literal fidelity and glossary-only context",
+    )
+    parser.add_argument(
+        "--parallel",
+        action="store_true",
+        help="Enable parallel chunk translation to test glossary-only context",
+    )
+    parser.add_argument(
+        "--parallel-context-strategy",
+        choices=["none", "glossary-only"],
+        default="none",
+        help="Context strategy for parallel mode (default: none)",
+    )
     args = parser.parse_args()
 
     asyncio.run(
@@ -116,5 +144,8 @@ if __name__ == "__main__":
             use_real_llm=args.real_llm,
             provider=args.provider,
             model_override=args.model,
+            fidelity_first=args.fidelity_first,
+            parallel=args.parallel,
+            parallel_context_strategy=args.parallel_context_strategy,
         )
     )

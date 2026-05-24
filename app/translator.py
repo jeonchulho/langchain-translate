@@ -54,6 +54,7 @@ DOCUMENT_TYPE_MODEL_PRESETS_ENV: Dict[str, str] = {
     "legal": "OPENAI_MODEL_LEGAL",
     "marketing": "OPENAI_MODEL_MARKETING",
 }
+FIDELITY_FIRST_STYLE_GUIDE = "원문 구조, 숫자, 고유명사, 고정 용어를 우선 보존하고 의역을 최소화하는 직역 중심 문체"
 
 
 def _new_token(index: int) -> str:
@@ -450,6 +451,12 @@ def _resolve_style_guide(request: TranslationRequest) -> str:
     문서 타입 스타일 프리셋 사용 시 preset과 사용자 추가 요구사항을 병합한다.
     """
 
+    if request.use_fidelity_first_preset:
+        custom = request.style_guide.strip()
+        if not custom or custom == DEFAULT_STYLE_GUIDE:
+            return FIDELITY_FIRST_STYLE_GUIDE
+        return f"{FIDELITY_FIRST_STYLE_GUIDE}; 추가 스타일 요구사항: {custom}"
+
     if not request.use_document_type_style_preset:
         return request.style_guide
 
@@ -460,6 +467,21 @@ def _resolve_style_guide(request: TranslationRequest) -> str:
         return preset
 
     return f"{preset}; 추가 스타일 요구사항: {custom}"
+
+
+def _resolve_parallel_context_text(request: TranslationRequest) -> str:
+    """병렬 번역에서 사용할 보조 문맥 텍스트를 결정한다.
+
+    - none: 빈 문자열
+    - glossary-only: 용어집만 주입
+    - fidelity-first 프리셋이 켜진 경우에도 glossary-only를 우선 사용한다.
+    """
+
+    if not request.glossary:
+        return ""
+    if request.use_fidelity_first_preset or request.parallel_context_strategy == "glossary-only":
+        return _build_glossary_text(request.glossary)
+    return ""
 
 
 def _resolve_model_name(request: TranslationRequest, default_model_name: str) -> str:
@@ -665,49 +687,6 @@ class TranslatorService:
             llm_call_mode,
         )
 
-    async def _summarize(
-        self,
-        translated: str,
-        resolved_model_name: str,
-        llm_provider: str,
-        llm_call_mode: str,
-        llm_reasoning: bool,
-    ) -> str:
-        """번역된 청크를 다음 청크 문맥용 요약으로 압축한다."""
-
-        messages = [
-            SystemMessage(content=self.summary_system),
-            HumanMessage(content=self.summary_human.format(text=translated)),
-        ]
-        return await _run_llm_with_mode(
-            self._get_llm(llm_provider, resolved_model_name, llm_reasoning),
-            messages,
-            llm_call_mode,
-        )
-
-    async def _summarize_source_for_parallel(
-        self,
-        source_text: str,
-        resolved_model_name: str,
-        llm_provider: str,
-        llm_call_mode: str,
-        llm_reasoning: bool,
-    ) -> str:
-        """병렬 번역용 원문 청크 요약을 생성한다.
-
-        source-summary 전략에서 각 청크의 이전 문맥 대체값으로 사용된다.
-        """
-
-        messages = [
-            SystemMessage(content=self.parallel_source_summary_system),
-            HumanMessage(content=self.parallel_source_summary_human.format(text=source_text)),
-        ]
-        return await _run_llm_with_mode(
-            self._get_llm(llm_provider, resolved_model_name, llm_reasoning),
-            messages,
-            llm_call_mode,
-        )
-
     async def _translate_markdown_table(
         self,
         table_text: str,
@@ -846,51 +825,6 @@ class TranslatorService:
             retried=retried,
         )
 
-    async def _build_parallel_context_summaries(
-        self,
-        chunks: List[str],
-        max_concurrency: int,
-        max_summary_chars: int,
-        resolved_model_name: str,
-        llm_provider: str,
-        llm_call_mode: str,
-        llm_reasoning: bool,
-    ) -> List[str]:
-        """병렬 번역에서 사용할 이전 문맥 요약 배열을 생성한다.
-
-        운영 관점 포인트:
-        - 완전 순차 의존 없이 문맥 힌트를 제공해 병렬 처리량을 유지한다.
-        - semaphore로 동시성을 제한해 provider rate limit 위험을 낮춘다.
-        - 요약 길이 제한으로 프롬프트 토큰 비용 급증을 억제한다.
-        """
-
-        if not chunks:
-            return []
-
-        current_summaries: List[str] = ["" for _ in chunks]
-        semaphore = asyncio.Semaphore(max_concurrency)
-
-        async def summarize_worker(idx: int, chunk: str) -> None:
-            async with semaphore:
-                raw_summary = await self._summarize_source_for_parallel(
-                    chunk,
-                    resolved_model_name,
-                    llm_provider,
-                    llm_call_mode,
-                    llm_reasoning,
-                )
-                current_summaries[idx] = _clamp_summary_text(raw_summary, max_summary_chars)
-
-        await asyncio.gather(
-            *(summarize_worker(idx, chunk) for idx, chunk in enumerate(chunks))
-        )
-
-        previous_context: List[str] = ["" for _ in chunks]
-        for idx in range(1, len(chunks)):
-            previous_context[idx] = current_summaries[idx - 1]
-
-        return previous_context
-
     async def translate(self, request: TranslationRequest) -> TranslationResponse:
         """전체 번역 파이프라인을 실행한다.
 
@@ -907,29 +841,35 @@ class TranslatorService:
         5) 결과 병합 및 평균 품질 점수 계산
         """
 
-        source_text = request.text
+        effective_request = (
+            request.model_copy(update={"max_retries_per_chunk": 0, "llm_reasoning": False})
+            if request.use_fidelity_first_preset
+            else request
+        )
+
+        source_text = effective_request.text
         preserve_mapping: Dict[str, str] = {}
         masked_text = source_text
-        resolved_style_guide = _resolve_style_guide(request)
-        resolved_model_name = _resolve_model_name(request, self.default_model_name)
-        llm_provider = request.llm_provider
-        llm_call_mode = request.llm_call_mode
-        llm_reasoning = request.llm_reasoning
+        resolved_style_guide = _resolve_style_guide(effective_request)
+        resolved_model_name = _resolve_model_name(effective_request, self.default_model_name)
+        llm_provider = effective_request.llm_provider
+        llm_call_mode = effective_request.llm_call_mode
+        llm_reasoning = effective_request.llm_reasoning
 
         if request.preserve_markdown_structures:
             masked_text, preserve_mapping = _protect_non_translatable(
                 source_text,
-                protect_special_entities=request.preserve_special_entities,
-                allowlist=request.special_entity_allowlist_regex,
-                denylist=request.special_entity_denylist_regex,
+                protect_special_entities=effective_request.preserve_special_entities,
+                allowlist=effective_request.special_entity_allowlist_regex,
+                denylist=effective_request.special_entity_denylist_regex,
             )
 
             masked_text, table_mapping, _ = _protect_markdown_tables(masked_text, len(preserve_mapping))
             for token, table_block in table_mapping.items():
-                if request.translate_markdown_tables:
+                if effective_request.translate_markdown_tables:
                     preserve_mapping[token] = await self._translate_markdown_table(
                         table_block,
-                        request,
+                        effective_request,
                         resolved_style_guide,
                         resolved_model_name,
                         llm_provider,
@@ -941,33 +881,21 @@ class TranslatorService:
 
             source_text = masked_text
 
-        splitter = _build_splitter(request.chunk_size, request.chunk_overlap)
+        splitter = _build_splitter(effective_request.chunk_size, effective_request.chunk_overlap)
         chunks = splitter.split_text(source_text)
 
         chunk_results: List[ChunkResult] = []
 
-        if request.parallel_chunk_translation:
-            semaphore = asyncio.Semaphore(request.max_concurrency)
-            context_summaries: List[str] = ["" for _ in chunks]
-            effective_summary_max_chars = _resolve_parallel_summary_max_chars(request)
-
-            if request.parallel_context_strategy == "source-summary":
-                context_summaries = await self._build_parallel_context_summaries(
-                    chunks=chunks,
-                    max_concurrency=request.max_concurrency,
-                    max_summary_chars=effective_summary_max_chars,
-                    resolved_model_name=resolved_model_name,
-                    llm_provider=llm_provider,
-                    llm_call_mode=llm_call_mode,
-                    llm_reasoning=llm_reasoning,
-                )
+        if effective_request.parallel_chunk_translation:
+            semaphore = asyncio.Semaphore(effective_request.max_concurrency)
+            context_text = _resolve_parallel_context_text(effective_request)
 
             async def worker(idx: int, chunk: str) -> ChunkResult:
                 async with semaphore:
                     result = await self._translate_chunk_with_retry(
                         chunk=chunk,
-                        request=request,
-                        previous_summary=context_summaries[idx],
+                        request=effective_request,
+                        previous_summary=context_text,
                         preserve_mapping=preserve_mapping,
                         resolved_style_guide=resolved_style_guide,
                         resolved_model_name=resolved_model_name,
@@ -986,7 +914,7 @@ class TranslatorService:
             for idx, chunk in enumerate(chunks):
                 result = await self._translate_chunk_with_retry(
                     chunk=chunk,
-                    request=request,
+                    request=effective_request,
                     previous_summary=previous_summary,
                     preserve_mapping=preserve_mapping,
                     resolved_style_guide=resolved_style_guide,
@@ -997,13 +925,7 @@ class TranslatorService:
                 )
                 result.index = idx
                 chunk_results.append(result)
-                previous_summary = await self._summarize(
-                    result.translated_text,
-                    resolved_model_name,
-                    llm_provider,
-                    llm_call_mode,
-                    llm_reasoning,
-                )
+                previous_summary = ""
 
         merged = "\n".join(c.translated_text for c in chunk_results)
         avg_score = round(mean(c.quality_score for c in chunk_results), 3) if chunk_results else 0.0
