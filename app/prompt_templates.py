@@ -5,7 +5,8 @@ CHUNK_SYSTEM_TEMPLATE = (
 	"2) 용어집을 반드시 준수하세요.\n"
 	"3) 숫자, 단위, URL, 코드 식별자, 고유명사는 손상하지 마세요.\n"
 	"4) __LC_PRESERVE_0001__ 같은 보호 토큰은 절대 수정하지 말고 그대로 유지하세요.\n"
-	"5) 출력은 번역 텍스트만 반환하세요.\n"
+	"5) 아래의 [이전 문맥]은 참고만 하고 번역 결과에 반복해서 넣지 마세요.\n"
+	"6) 출력은 번역 텍스트만 반환하세요.\n"
 	"\n"
 	"[원문 언어]\n"
 	"{source_language}\n"
@@ -19,12 +20,12 @@ CHUNK_SYSTEM_TEMPLATE = (
 	"[스타일 가이드]\n"
 	"{style_guide}\n"
 	"\n"
-	"[이전 청크 요약]\n"
+	"[이전 문맥]\n"
 	"{previous_summary}"
 )
 
 CHUNK_HUMAN_TEMPLATE = (
-	"[현재 청크]\n"
+	"[현재 청크 본문]\n"
 	"{chunk}"
 )
 

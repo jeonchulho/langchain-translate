@@ -373,6 +373,22 @@ def _build_splitter(chunk_size: int, chunk_overlap: int) -> RecursiveCharacterTe
     )
 
 
+def _resolve_effective_chunk_overlap(request: TranslationRequest) -> int:
+    """요청 설정에서 실제 사용할 오버랩 길이를 계산한다."""
+
+    if not request.auto_chunk_overlap:
+        return request.chunk_overlap
+
+    ratio_overlap = int(request.chunk_size * request.auto_chunk_overlap_ratio)
+    effective = max(50, min(request.chunk_overlap, request.auto_chunk_overlap_max, ratio_overlap))
+
+    # fidelity-first에서는 문맥 손실을 줄이기 위해 최소 문맥량을 보장한다.
+    if request.use_fidelity_first_preset:
+        effective = max(effective, min(request.chunk_overlap, 120))
+
+    return effective
+
+
 def _clamp_summary_text(text: str, max_chars: int = PARALLEL_SUMMARY_MAX_CHARS) -> str:
     """요약 텍스트 길이를 최대 문자 수로 제한한다.
 
@@ -504,6 +520,58 @@ def _resolve_model_name(request: TranslationRequest, default_model_name: str) ->
         return os.getenv(env_key, default_model_name)
 
     return default_model_name
+
+
+def _find_sentence_safe_context_start(text: str, min_context_chars: int) -> int:
+    """문장 경계에 맞는 컨텍스트 시작 지점을 찾는다.
+
+    반환값은 text의 시작 인덱스이다.
+    - 문장 끝(., !, ?, 。, ！, ？, 줄바꿈) 직후를 우선한다.
+    - 충분히 긴 문맥을 확보할 수 있는 가장 앞쪽 경계를 고른다.
+    - 적절한 경계를 못 찾으면 0을 반환해 원문 suffix 전체를 사용한다.
+    """
+
+    if not text:
+        return 0
+
+    boundary_pattern = re.compile(r"[.!?。！？\n]")
+    for match in boundary_pattern.finditer(text):
+        start = match.end()
+        if len(text) - start >= min_context_chars:
+            while start < len(text) and text[start].isspace():
+                start += 1
+            return start
+
+    return 0
+
+
+def _build_overlap_context(previous_chunk: str, chunk_overlap: int) -> str:
+    """이전 청크 끝부분에서 현재 청크용 문맥을 만든다.
+
+    오버랩은 실제 번역 대상이 아니라 문맥 힌트로만 사용한다.
+    문장 경계에 맞는 시작점을 우선하고, 없으면 요청된 오버랩 길이만큼의 suffix를 사용한다.
+    """
+
+    if not previous_chunk or chunk_overlap <= 0:
+        return ""
+
+    overlap_length = min(chunk_overlap, len(previous_chunk))
+    suffix = previous_chunk[-overlap_length:]
+    min_context_chars = max(40, overlap_length // 2)
+    start = _find_sentence_safe_context_start(suffix, min_context_chars)
+    context = suffix[start:] if start < len(suffix) else suffix
+    return context.lstrip()
+
+
+def _strip_overlap_prefix(chunk: str, chunk_overlap: int, is_first_chunk: bool) -> str:
+    """중복 출력을 막기 위해 현재 청크의 오버랩 prefix를 제거한다."""
+
+    if is_first_chunk or chunk_overlap <= 0:
+        return chunk
+
+    cut = min(chunk_overlap, len(chunk))
+    body = chunk[cut:]
+    return body if body else chunk
 
 
 class TranslatorService:
@@ -881,7 +949,8 @@ class TranslatorService:
 
             source_text = masked_text
 
-        splitter = _build_splitter(effective_request.chunk_size, effective_request.chunk_overlap)
+        effective_overlap = _resolve_effective_chunk_overlap(effective_request)
+        splitter = _build_splitter(effective_request.chunk_size, effective_overlap)
         chunks = splitter.split_text(source_text)
 
         chunk_results: List[ChunkResult] = []
@@ -892,10 +961,17 @@ class TranslatorService:
 
             async def worker(idx: int, chunk: str) -> ChunkResult:
                 async with semaphore:
+                    chunk_body = _strip_overlap_prefix(chunk, effective_overlap, idx == 0)
+                    overlap_context = (
+                        _build_overlap_context(chunks[idx - 1], effective_overlap)
+                        if idx > 0
+                        else ""
+                    )
+                    combined_context = "\n\n".join(part for part in [overlap_context, context_text] if part)
                     result = await self._translate_chunk_with_retry(
-                        chunk=chunk,
+                        chunk=chunk_body,
                         request=effective_request,
-                        previous_summary=context_text,
+                        previous_summary=combined_context,
                         preserve_mapping=preserve_mapping,
                         resolved_style_guide=resolved_style_guide,
                         resolved_model_name=resolved_model_name,
@@ -910,12 +986,17 @@ class TranslatorService:
                 *(worker(idx, chunk) for idx, chunk in enumerate(chunks))
             )
         else:
-            previous_summary = ""
             for idx, chunk in enumerate(chunks):
+                chunk_body = _strip_overlap_prefix(chunk, effective_overlap, idx == 0)
+                overlap_context = (
+                    _build_overlap_context(chunks[idx - 1], effective_overlap)
+                    if idx > 0
+                    else ""
+                )
                 result = await self._translate_chunk_with_retry(
-                    chunk=chunk,
+                    chunk=chunk_body,
                     request=effective_request,
-                    previous_summary=previous_summary,
+                    previous_summary=overlap_context,
                     preserve_mapping=preserve_mapping,
                     resolved_style_guide=resolved_style_guide,
                     resolved_model_name=resolved_model_name,
@@ -925,7 +1006,6 @@ class TranslatorService:
                 )
                 result.index = idx
                 chunk_results.append(result)
-                previous_summary = ""
 
         merged = "\n".join(c.translated_text for c in chunk_results)
         avg_score = round(mean(c.quality_score for c in chunk_results), 3) if chunk_results else 0.0

@@ -5,7 +5,8 @@ CHUNK_SYSTEM_TEMPLATE = (
     "2) Strictly follow the glossary.\n"
     "3) Do not alter numbers, units, URLs, code identifiers, or proper nouns.\n"
     "4) Never modify protected tokens such as __LC_PRESERVE_0001__.\n"
-    "5) Return only the translated text.\n"
+    "5) Treat the [Previous Context] as reference only and do not repeat it in the translation.\n"
+    "6) Return only the translated text.\n"
     "\n"
     "[Source Language]\n"
     "{source_language}\n"
@@ -19,12 +20,12 @@ CHUNK_SYSTEM_TEMPLATE = (
     "[Style Guide]\n"
     "{style_guide}\n"
     "\n"
-    "[Previous Chunk Summary]\n"
+    "[Previous Context]\n"
     "{previous_summary}"
 )
 
 CHUNK_HUMAN_TEMPLATE = (
-    "[Current Chunk]\n"
+    "[Current Chunk Body]\n"
     "{chunk}"
 )
 

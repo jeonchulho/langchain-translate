@@ -6,6 +6,8 @@ from app.translator import (
     DOCUMENT_TYPE_STYLE_PRESETS,
     FIDELITY_FIRST_STYLE_GUIDE,
     TranslatorService,
+    _build_overlap_context,
+    _resolve_effective_chunk_overlap,
     _resolve_model_name,
     _resolve_parallel_context_text,
     _resolve_style_guide,
@@ -60,7 +62,9 @@ def test_parallel_glossary_only_context_is_applied_with_fidelity_first() -> None
     response = asyncio.run(service.translate(request))
 
     assert len(response.chunks) >= 2
-    assert all(summary == "- Rotary: 로타리\n- club: 클럽" for summary in seen_previous_summaries)
+    assert seen_previous_summaries[0] == "- Rotary: 로타리\n- club: 클럽"
+    assert all("- Rotary: 로타리\n- club: 클럽" in summary for summary in seen_previous_summaries[1:])
+    assert any(summary.startswith("A") or summary.startswith("B") or summary.startswith("C") for summary in seen_previous_summaries[1:])
     assert all(retries == 0 for retries, _ in seen_retry_settings)
     assert all(reasoning is False for _, reasoning in seen_retry_settings)
 
@@ -101,7 +105,8 @@ def test_parallel_none_context_stays_empty() -> None:
     response = asyncio.run(service.translate(request))
 
     assert len(response.chunks) >= 2
-    assert all(summary == "" for summary in seen_previous_summaries)
+    assert seen_previous_summaries[0] == ""
+    assert all(summary != "" for summary in seen_previous_summaries[1:])
 
 
 def test_fidelity_first_style_guide_overrides_document_preset() -> None:
@@ -177,3 +182,43 @@ def test_style_guide_merges_custom_style_when_preset_enabled() -> None:
     resolved = _resolve_style_guide(request)
     assert DOCUMENT_TYPE_STYLE_PRESETS["technical"] in resolved
     assert "숫자 표기는 원문과 동일하게 유지" in resolved
+
+
+def test_auto_chunk_overlap_uses_ratio_and_max_cap() -> None:
+    request = TranslationRequest(
+        text="dummy",
+        target_language="ko",
+        chunk_size=2000,
+        chunk_overlap=500,
+        auto_chunk_overlap=True,
+        auto_chunk_overlap_ratio=0.1,
+        auto_chunk_overlap_max=180,
+    )
+
+    assert _resolve_effective_chunk_overlap(request) == 180
+
+
+def test_auto_chunk_overlap_keeps_more_context_for_fidelity_first() -> None:
+    request = TranslationRequest(
+        text="dummy",
+        target_language="ko",
+        chunk_size=1200,
+        chunk_overlap=220,
+        auto_chunk_overlap=True,
+        auto_chunk_overlap_ratio=0.05,
+        auto_chunk_overlap_max=150,
+        use_fidelity_first_preset=True,
+    )
+
+    assert _resolve_effective_chunk_overlap(request) == 120
+
+
+def test_overlap_context_prefers_sentence_boundary() -> None:
+    previous_chunk = (
+        "첫 문장입니다. "
+        "두 번째 문장은 더 길고 문맥을 충분히 제공합니다. "
+        "세 번째 문장도 충분히 길어서 경계 선택 조건을 만족합니다."
+    )
+    context = _build_overlap_context(previous_chunk, 80)
+
+    assert context.startswith("두 번째")

@@ -17,6 +17,22 @@ class TranslationRequest(BaseModel):
     )
     chunk_size: int = Field(default=3500, ge=1200, le=7000)
     chunk_overlap: int = Field(default=350, ge=50, le=1000)
+    auto_chunk_overlap: bool = Field(
+        default=False,
+        description="Automatically tune effective overlap from chunk size and ratio",
+    )
+    auto_chunk_overlap_ratio: float = Field(
+        default=0.15,
+        ge=0.05,
+        le=0.4,
+        description="When auto_chunk_overlap=true, use chunk_size * ratio as overlap candidate",
+    )
+    auto_chunk_overlap_max: int = Field(
+        default=450,
+        ge=50,
+        le=1000,
+        description="Upper bound for effective overlap when auto_chunk_overlap=true",
+    )
     max_retries_per_chunk: int = Field(default=1, ge=0, le=3)
     parallel_chunk_translation: bool = Field(
         default=False,
